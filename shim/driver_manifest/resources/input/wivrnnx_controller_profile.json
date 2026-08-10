@@ -1,0 +1,57 @@
+{
+	"jsonid": "input_profile",
+	"controller_type": "wivrnnx_controller",
+	"device_class": "TrackedDeviceClass_Controller",
+	"resource_root": "wivrnnx",
+	"driver_name": "wivrnnx",
+	"input_bindingui_mode": "controller_handed",
+	"should_show_binding_errors": false,
+	"input_source": {
+		"/input/system": {
+			"type": "button",
+			"click": true
+		},
+		"/input/application_menu": {
+			"type": "button",
+			"click": true
+		},
+		"/input/a": {
+			"type": "button",
+			"click": true
+		},
+		"/input/b": {
+			"type": "button",
+			"click": true
+		},
+		"/input/x": {
+			"type": "button",
+			"click": true
+		},
+		"/input/y": {
+			"type": "button",
+			"click": true
+		},
+		"/input/trigger": {
+			"type": "trigger",
+			"click": true,
+			"touch": true,
+			"value": true
+		},
+		"/input/grip": {
+			"type": "trigger",
+			"click": true,
+			"value": true
+		},
+		"/input/joystick": {
+			"type": "joystick",
+			"click": true,
+			"touch": true
+		},
+		"/output/haptic": {
+			"type": "vibration"
+		},
+		"/pose/raw": {
+			"type": "pose"
+		}
+	}
+}

@@ -1,0 +1,7 @@
+{
+	"driver_wivrnnx": {
+		"enable": true,
+		"blocked_by_safe_mode": false,
+		"loadPriority": 100
+	}
+}

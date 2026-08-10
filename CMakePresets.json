@@ -1,0 +1,28 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "vs2022",
+      "displayName": "Windows / Visual Studio 2022",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2022",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "mingw-check",
+      "displayName": "Linux cross compile-check (llvm-mingw)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/mingw-check",
+      "toolchainFile": "${sourceDir}/cmake/llvm-mingw-toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "WIVRNNX_LINUX_REPO": "/run/media/nerdrx/Lex/claude/wivrn-nx"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "vs2022", "configurePreset": "vs2022", "configuration": "RelWithDebInfo" },
+    { "name": "mingw-check", "configurePreset": "mingw-check" }
+  ]
+}

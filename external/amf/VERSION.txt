@@ -1,0 +1,3 @@
+AMF 1.5.2 (amf/public/include)
+https://github.com/GPUOpen-LibrariesAndSDKs/AMF
+c35f613aea2e5057a688c979e75b1cf24253297e

@@ -1,0 +1,10 @@
+{
+	"jsonid": "vrresources",
+	"statusicons": {},
+	"strings": {
+		"default": {
+			"wivrnnx_hmd": "WiVRn NX Headset",
+			"wivrnnx_controller": "WiVRn NX Controller"
+		}
+	}
+}
