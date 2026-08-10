@@ -72,11 +72,13 @@ endif()
 
 if(WIVRNNX_HELPER_FULL)
     list(APPEND WIVRNNX_HELPER_SOURCES
+        src/wivrn/bitrate_controller.cpp
         src/wivrn/clock_offset.cpp
         src/wivrn/mdns_publisher.cpp
         src/wivrn/server.cpp
         src/wivrn/session.cpp
         src/wivrn/store.cpp
+        src/wivrn/synthetic_video.cpp
         src/wivrn/video_out.cpp
     )
 endif()

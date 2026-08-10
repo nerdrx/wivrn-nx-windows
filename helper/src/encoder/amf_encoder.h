@@ -95,6 +95,22 @@ public:
 		return codec_;
 	}
 
+	// A new target for the running component, bits per second for this one eye.
+	//
+	// The three properties are the ones the automatic bitrate has to move together:
+	// TARGET_BITRATE and PEAK_BITRATE (equal, this is CBR) and VBV_BUFFER_SIZE,
+	// which is sized from the bitrate and would otherwise still describe the old
+	// one — a VBV left at the old number is either an encoder that cannot use the
+	// bandwidth it was given or one that is allowed to spend several frames paying
+	// back a spike, which is the latency this path cannot afford.
+	//
+	// AMF takes all three on a live component: they are AMF_PROPERTY_ACCESS_FULL
+	// on the encoder (see components/VideoEncoderHEVC.h and VideoEncoderVCE.h in
+	// external/amf), so no Terminate/Init is needed and no parameter set is
+	// re-emitted, which is the whole point — a rebuild would cost an IDR every
+	// time the controller moved.
+	void set_bitrate(uint32_t bitrate_bps);
+
 	// Allocates an input surface, hands its native DX11 texture to `fill`, and
 	// runs it through the encoder. `fill` returns false to abandon the frame
 	// (the surface is dropped and nothing is submitted).

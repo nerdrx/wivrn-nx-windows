@@ -17,6 +17,8 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <deque>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -26,9 +28,12 @@
 
 #include "../bridge.h"
 #include "../video_bridge.h"
+#include "bitrate_controller.h"
 #include "clock_offset.h"
 #include "idr_tracker.h"
 #include "pose_sanitize.h"
+#include "shard_pacer.h"
+#include "video_out.h"
 #include "wivrnnx_ipc.h"
 
 namespace wivrnnx::helper
@@ -103,9 +108,29 @@ private:
 	// Tells the encoder thread what this client can decode and how fast.
 	void publish_video_request();
 
-	// Moves whatever the encoder thread produced onto the socket.
+	// Moves whatever the encoder thread produced onto the socket, a paced
+	// micro-burst at a time. Never blocks: what is not due yet is left for the
+	// next turn of the loop, and next_video_due_ says when that is.
 	void pump_video();
-	void send_video_frame(EncodedFrame & frame);
+	// Starts the frame at the head of the queue. Returns false when it produced
+	// nothing (an empty bitstream), in which case the caller pops and retries.
+	bool begin_video_frame(int64_t now_ns);
+	// Books the frame that just finished: counters, the IDR tracker, and the byte
+	// count the bandwidth estimator eats.
+	void finish_video_frame();
+
+	// The transport half of the client's settings: the bitrate controller's two
+	// switches and its control law, packet pacing, and forward error correction.
+	// Read out of headset_info/settings_changed, ANDed with the command line.
+	void configure_transport();
+	// A bitrate the controller decided, in bits per second on the link. Turns it
+	// into what the encoder should be told to produce and hands it over.
+	void apply_bitrate(std::optional<uint32_t> bitrate_bps);
+
+	int64_t frame_period_ns() const
+	{
+		return refresh_hz_ > 1.f ? int64_t(1e9 / double(refresh_hz_)) : 0;
+	}
 
 	void on_tracking(const wivrn::from_headset::tracking & tracking);
 	void on_inputs(const wivrn::from_headset::inputs & inputs);
@@ -162,10 +187,36 @@ private:
 	uint64_t stream_generation_ = 0;
 	std::vector<EncodedFrame> video_scratch_;
 
+	// --- transport ---------------------------------------------------------
+
+	BitrateController bitrate_;
+	// The pacing window of the socket, shared by the frames of one slot: both eyes
+	// of a frame are drained by this thread, so they divide one window between them
+	// rather than taking one each (shard_pacer.h:162-176).
+	PacingSlot pacing_slot_;
+	PacedSender sender_;
+	PacedSender::Sinks sinks_;
+	// Frames handed over by the encoder thread, oldest first. The one at the front
+	// is the one PacedSender is working through, and its bitstream must not move
+	// while it is: the shard payloads are spans into it.
+	std::deque<EncodedFrame> video_queue_;
+	// Deeper than VideoBridge::kMaxQueued would ever hand over at once; a pacer
+	// that fell behind must still not let this grow without bound.
+	static constexpr size_t kMaxVideoQueued = 6;
+
+	bool pacing_enabled_ = true;
+	float pacing_window_ = 0.4f;
+	bool fec_enabled_ = false;
+	// Absolute monotonic time the next micro-burst is due, 0 when nothing is
+	// waiting. What the poll() timeout is shortened to.
+	int64_t next_video_due_ = 0;
+
 	uint64_t video_frames_sent_ = 0;
 	uint64_t video_shards_sent_ = 0;
+	uint64_t video_parity_sent_ = 0;
 	uint64_t video_bytes_sent_ = 0;
 	uint64_t video_send_errors_ = 0;
+	uint64_t video_frames_dropped_ = 0;
 	uint64_t idr_requests_ = 0;
 	uint32_t feedback_logged_ = 0;
 

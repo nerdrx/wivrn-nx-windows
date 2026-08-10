@@ -5,12 +5,33 @@
 namespace wivrnnx::helper
 {
 
-void VideoBridge::set_prefs(uint32_t bitrate_bps, int codec)
+void VideoBridge::set_prefs(uint32_t bitrate_bps, int codec, bool adaptive)
 {
 	std::lock_guard lock(mutex_);
 	pref_bitrate_bps_ = bitrate_bps;
 	pref_codec_ = codec;
+	pref_adaptive_ = adaptive;
 	request_.bitrate_bps = bitrate_bps;
+}
+
+VideoBridge::Prefs VideoBridge::prefs() const
+{
+	std::lock_guard lock(mutex_);
+	return Prefs{pref_bitrate_bps_, pref_codec_, pref_adaptive_};
+}
+
+void VideoBridge::set_bitrate(uint32_t bitrate_bps)
+{
+	std::lock_guard lock(mutex_);
+	if (not request_.active or bitrate_bps == 0 or bitrate_bps == request_.bitrate_bps)
+		return;
+
+	request_.bitrate_bps = bitrate_bps;
+	// Deliberately not config_generation: a bitrate change must not rebuild the
+	// encoder. AMF takes TARGET/PEAK_BITRATE and the VBV size at runtime, and a
+	// rebuild would cost a parameter set, an IDR and a stream description round
+	// trip every time the controller moved.
+	++request_.bitrate_generation;
 }
 
 void VideoBridge::set_client(float refresh_hz, bool allow_h265, bool allow_h264)
@@ -31,7 +52,13 @@ void VideoBridge::set_client(float refresh_hz, bool allow_h265, bool allow_h264)
 
 	request_.active = true;
 	request_.refresh_hz = refresh_hz;
-	request_.bitrate_bps = pref_bitrate_bps_;
+	// A new session starts at the ceiling, whatever the last one's controller had
+	// walked the bitrate down to.
+	if (request_.bitrate_bps != pref_bitrate_bps_)
+	{
+		request_.bitrate_bps = pref_bitrate_bps_;
+		++request_.bitrate_generation;
+	}
 	request_.allow_h265 = allow_h265;
 	request_.allow_h264 = allow_h264;
 

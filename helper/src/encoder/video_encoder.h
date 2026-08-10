@@ -49,6 +49,9 @@ struct EncodedFrame
 struct EncoderConfig
 {
 	float refresh_hz = 90.f;
+	// Bits per second on the wire for the whole stream, i.e. both eyes together.
+	// The encoder splits it; the bitrate controller and the command line both talk
+	// about the link, not about one component.
 	uint32_t bitrate_bps = 50'000'000;
 	bool allow_h265 = true;
 	bool allow_h264 = true;
@@ -85,6 +88,11 @@ public:
 	                       uint32_t vrserver_pid,
 	                       const EncoderConfig & config) = 0;
 	virtual void shutdown() = 0;
+
+	// A new target for a running encoder, whole stream (both eyes), bits per
+	// second. Must not rebuild anything: this is called whenever the automatic
+	// bitrate control moves, which on a bad link is once a second.
+	virtual void set_bitrate(uint32_t bitrate_bps) = 0;
 
 	virtual EncoderStreamInfo stream_info() const = 0;
 

@@ -26,6 +26,18 @@
 //   Part E: the two geometry helpers next to the packetizer - the head-times-eye
 //           pose composition and the neutral foveation map, which the headset
 //           asserts on.
+//   Part F: forward error correction. The same diff-against-upstream trick as
+//           Part B, one level up: tests/fec_test.cpp:101-158 in the Linux tree is
+//           WiVRn's own transcription of how SendData drives fec::group_builder,
+//           and every parity shard this port emits has to match the one that
+//           transcription produces, field for field and byte for byte. Then the
+//           parity shards are actually used: one data shard per group is dropped
+//           and wivrn::fec::reconstruct (the same function the headset runs) has
+//           to hand back exactly what was dropped.
+//   Part G: pacing. The PacedSender driven on a virtual clock, with the inter-send
+//           gaps measured: the bytes have to leave in ShardPacer::group_bytes
+//           micro-bursts spread over the budget, the whole frame has to be out by
+//           the end of it, and an unpaced frame has to still leave in one go.
 //
 // Native Linux build; see run_tests.sh next to this file.
 
@@ -66,6 +78,7 @@ int failures = 0;
 	} while (0)
 
 using data_shard = to_headset::video_stream_data_shard;
+using parity_shard = to_headset::video_stream_parity_shard;
 using view_info_t = data_shard::view_info_t;
 using timing_info_t = data_shard::timing_info_t;
 
@@ -163,6 +176,15 @@ struct CapturedShard
 	data_shard shard;
 	std::vector<uint8_t> payload;
 	bool control = false;
+	// Virtual time the sender handed it over, Part G only.
+	int64_t at = 0;
+};
+
+struct CapturedParity
+{
+	parity_shard shard;
+	std::vector<uint8_t> payload;
+	int64_t at = 0;
 };
 
 std::vector<CapturedShard> run_packetizer(const VideoPacketizer::Frame & frame, std::vector<uint8_t> & data)
@@ -178,6 +200,67 @@ std::vector<CapturedShard> run_packetizer(const VideoPacketizer::Frame & frame, 
 		out.back().shard.payload = out.back().payload;
 	});
 	return out;
+}
+
+// Everything one PacedSender run produced, with the payloads copied out and the
+// virtual time of every send recorded.
+struct PacedRun
+{
+	std::vector<CapturedShard> shards;
+	std::vector<CapturedParity> parity;
+	// Absolute virtual times pump() asked to be called back at.
+	std::vector<int64_t> waits;
+	int64_t started = 0;
+	int64_t finished = 0;
+};
+
+// Drives a PacedSender to completion on a virtual clock: the sends themselves are
+// free, and time only advances when the pacer says the next burst is not due yet.
+// That is the same trick tests/pacing_test.cpp:53-69 uses upstream.
+PacedRun run_paced(const VideoPacketizer::Frame & frame,
+                   std::vector<uint8_t> & data,
+                   int64_t start,
+                   int64_t budget)
+{
+	PacedRun run;
+	run.started = start;
+	int64_t now = start;
+
+	wivrnnx::helper::PacedSender sender;
+	sender.begin(frame, std::span<uint8_t>(data), wivrnnx::helper::ShardPacer(start, budget, data.size()));
+
+	wivrnnx::helper::PacedSender::Sinks sinks;
+	sinks.data = [&](data_shard && shard, bool control) {
+		CapturedShard captured;
+		captured.payload.assign(shard.payload.begin(), shard.payload.end());
+		captured.control = control;
+		captured.at = now;
+		captured.shard = std::move(shard);
+		run.shards.push_back(std::move(captured));
+		run.shards.back().shard.payload = run.shards.back().payload;
+	};
+	sinks.parity = [&](parity_shard && shard) {
+		CapturedParity captured;
+		captured.payload.assign(shard.payload.begin(), shard.payload.end());
+		captured.at = now;
+		captured.shard = std::move(shard);
+		run.parity.push_back(std::move(captured));
+		run.parity.back().shard.payload = run.parity.back().payload;
+	};
+
+	while (sender.active())
+	{
+		const int64_t due = sender.pump(now, sinks);
+		if (due == 0)
+			break;
+		run.waits.push_back(due);
+		// A caller that is late is exactly what the session's poll() timeout can
+		// produce; the pacer must cope with now being past the deadline too.
+		now = std::max(now, due);
+	}
+
+	run.finished = now;
+	return run;
 }
 
 // --------------------------------------------------------------------------
@@ -512,6 +595,347 @@ void part_e_geometry()
 	}
 }
 
+// --------------------------------------------------------------------------
+// Part F's reference: WiVRn's own transcription of how SendData drives
+// fec::group_builder, tests/fec_test.cpp:101-158, with nothing changed but the
+// return type - the shards themselves are already checked by Part B, so only the
+// parity is kept here.
+// --------------------------------------------------------------------------
+struct ReferenceParity
+{
+	uint16_t first_shard_idx = 0;
+	std::vector<uint16_t> blob_size;
+	std::vector<uint8_t> payload;
+};
+
+std::vector<ReferenceParity> reference_parity(std::vector<uint8_t> & encoded,
+                                              const view_info_t & view_info,
+                                              const timing_info_t & timing_info,
+                                              uint8_t stream_idx,
+                                              uint64_t frame_idx)
+{
+	std::vector<ReferenceParity> out;
+
+	fec::group_builder builder;
+	builder.reset(stream_idx, frame_idx);
+
+	data_shard shard;
+	shard.stream_item_idx = stream_idx;
+	shard.frame_idx = frame_idx;
+	shard.shard_idx = 0;
+	shard.view_info = view_info;
+
+	auto take_parity = [&] {
+		if (auto p = builder.take())
+			out.push_back(ReferenceParity{p->first_shard_idx,
+			                              p->blob_size,
+			                              std::vector<uint8_t>(p->payload.begin(), p->payload.end())});
+	};
+
+	const size_t bytes = encoded.size();
+	size_t offset = 0;
+	while (offset < bytes)
+	{
+		const size_t budget = fec::shard_payload_budget(true) - serialized_size(shard.view_info);
+		const size_t next = std::min(bytes, offset + budget);
+		if (next == bytes)
+			shard.timing_info = timing_info;
+		shard.payload = std::span<uint8_t>(encoded).subspan(offset, next - offset);
+
+		builder.add(shard);
+		if (builder.full())
+			take_parity();
+
+		++shard.shard_idx;
+		shard.view_info.reset();
+		offset = next;
+	}
+	take_parity();
+
+	return out;
+}
+
+void part_f_fec()
+{
+	std::printf("Part F: parity shards against upstream, and reconstruction by the client's own fec\n");
+
+	for (size_t target: {size_t(1), size_t(1336), size_t(5000), size_t(200 * 1024)})
+	{
+		std::vector<uint8_t> data = make_bitstream(target, false, uint32_t(target + 17));
+		auto frame = make_frame_desc(false, true);
+		frame.fec = true;
+		CHECK(frame.fec_active());
+
+		// Unpaced, so that the split between "sent" and "paced back" cannot
+		// influence where a group ends. Pacing is Part G's business.
+		PacedRun run = run_paced(frame, data, 0, 0);
+
+		// The data boundaries are upstream's with FEC on, which is 64 bytes per
+		// shard less than without it (fec::payload_reserve).
+		const std::vector<size_t> expected = reference_boundaries(data.size(), frame.view_info, true);
+		CHECK(run.shards.size() == expected.size());
+		for (size_t i = 0; i < expected.size() && i < run.shards.size(); ++i)
+			CHECK(run.shards[i].payload.size() == expected[i]);
+
+		// One parity per group, the last one usually short.
+		CHECK(run.parity.size() == (run.shards.size() + fec::group_size - 1) / fec::group_size);
+
+		std::vector<ReferenceParity> reference =
+		        reference_parity(data, frame.view_info, frame.timing_info, frame.stream_index, frame.frame_index);
+		CHECK(reference.size() == run.parity.size());
+
+		for (size_t i = 0; i < reference.size() && i < run.parity.size(); ++i)
+		{
+			const parity_shard & got = run.parity[i].shard;
+			CHECK(got.stream_item_idx == frame.stream_index);
+			CHECK(got.frame_idx == frame.frame_index);
+			CHECK(got.first_shard_idx == reference[i].first_shard_idx);
+			CHECK(got.blob_size == reference[i].blob_size);
+			CHECK(run.parity[i].payload == reference[i].payload);
+			// A parity shard must never be a bigger datagram than the data
+			// shards it covers, which is what payload_reserve is for.
+			CHECK(run.parity[i].payload.size() <= data_shard::max_payload_size);
+		}
+
+		// Ordering: a group's parity goes out immediately after that group's last
+		// data shard, not in a tail burst (video_encoder.cpp:641-658).
+		for (size_t i = 0; i + 1 < run.parity.size(); ++i)
+		{
+			const size_t covered = run.parity[i].shard.first_shard_idx + run.parity[i].shard.blob_size.size();
+			CHECK(covered == fec::group_size * (i + 1));
+		}
+
+		// And now the point of all of it: drop one shard of every group and let
+		// the client's own reconstruct() put it back.
+		for (const CapturedParity & p: run.parity)
+		{
+			const size_t n = p.shard.blob_size.size();
+			const uint16_t dropped = uint16_t(p.shard.first_shard_idx + n / 2);
+
+			auto present = [&](uint16_t idx) -> const data_shard * {
+				if (idx == dropped || idx >= run.shards.size())
+					return nullptr;
+				return &run.shards[idx].shard;
+			};
+
+			auto rebuilt = fec::reconstruct(p.shard, present);
+			CHECK(rebuilt.has_value());
+			if (not rebuilt)
+				continue;
+
+			const data_shard & original = run.shards[dropped].shard;
+			CHECK(rebuilt->shard_idx == original.shard_idx);
+			CHECK(rebuilt->frame_idx == original.frame_idx);
+			CHECK(rebuilt->stream_item_idx == original.stream_item_idx);
+			CHECK(rebuilt->view_info.has_value() == original.view_info.has_value());
+			CHECK(rebuilt->timing_info.has_value() == original.timing_info.has_value());
+			CHECK(rebuilt->payload.size() == original.payload.size());
+			CHECK(std::memcmp(rebuilt->payload.data(), original.payload.data(), original.payload.size()) == 0);
+
+			// Two erasures are out of reach of a single parity shard, and must
+			// come back as "no reconstruction" rather than as nonsense.
+			if (n > 2)
+			{
+				auto two_gone = [&](uint16_t idx) -> const data_shard * {
+					if (idx == dropped || idx == p.shard.first_shard_idx || idx >= run.shards.size())
+						return nullptr;
+					return &run.shards[idx].shard;
+				};
+				CHECK(not fec::reconstruct(p.shard, two_gone).has_value());
+			}
+		}
+	}
+
+	// Gating. Parity is only worth anything on the lossy path.
+	{
+		std::vector<uint8_t> data = make_bitstream(50'000, false, 21);
+
+		// A TCP-only session: nothing can be lost, so nothing is protected.
+		auto tcp = make_frame_desc(false, false);
+		tcp.fec = true;
+		CHECK(not tcp.fec_active());
+		PacedRun tcp_run = run_paced(tcp, data, 0, 0);
+		CHECK(tcp_run.parity.empty());
+		CHECK(tcp_run.shards.size() == 1);
+
+		// An IDR, which rides the control socket whole: TCP again, and the one
+		// frame that must not be made bigger.
+		auto idr = make_frame_desc(true, true);
+		idr.fec = true;
+		CHECK(not idr.fec_active());
+		PacedRun idr_run = run_paced(idr, data, 0, 0);
+		CHECK(idr_run.parity.empty());
+		CHECK(idr_run.shards.size() == 1);
+		CHECK(idr_run.shards[0].control);
+
+		// FEC off is the shard budget unchanged, i.e. the pre-FEC behaviour.
+		auto plain = make_frame_desc(false, true);
+		CHECK(VideoPacketizer::payload_budget(plain) == data_shard::max_payload_size);
+		auto with_fec = plain;
+		with_fec.fec = true;
+		CHECK(VideoPacketizer::payload_budget(with_fec) ==
+		      data_shard::max_payload_size - fec::payload_reserve);
+	}
+
+	// The whole point of the overhead, measured: one shard in group_size.
+	{
+		std::vector<uint8_t> data = make_bitstream(200 * 1024, false, 23);
+		auto frame = make_frame_desc(false, true);
+		frame.fec = true;
+		PacedRun run = run_paced(frame, data, 0, 0);
+
+		size_t data_bytes = 0;
+		for (const CapturedShard & s: run.shards)
+			data_bytes += serialized_size(s.shard);
+		size_t parity_bytes = 0;
+		for (const CapturedParity & p: run.parity)
+			parity_bytes += serialized_size(p.shard);
+
+		const double overhead = double(parity_bytes) / double(data_bytes);
+		CHECK(overhead > 0.10 && overhead < 0.15);
+	}
+}
+
+void part_g_pacing()
+{
+	std::printf("Part G: pacing spreads a frame over its window\n");
+
+	using wivrnnx::helper::ShardPacer;
+
+	// 208 kB at 90 fps, spread over 40% of a frame period: upstream's own worked
+	// example (shard_pacer.h:29-56, tests/pacing_test.cpp:43-48).
+	constexpr int64_t period = 11'111'111;
+	const int64_t budget = int64_t(period * 0.4);
+	const int64_t start = 1'000'000'000;
+
+	std::vector<uint8_t> data = make_bitstream(208 * 1024, false, 31);
+	auto frame = make_frame_desc(false, true);
+	frame.fec = true;
+
+	PacedRun run = run_paced(frame, data, start, budget);
+
+	CHECK(run.shards.size() > 100);
+	CHECK(not run.waits.empty());
+
+	// Every byte is out by the end of the budget, and the budget is a fraction of
+	// a frame period, so a frame never runs into the next one.
+	CHECK(run.finished <= start + budget);
+	CHECK(run.finished - start < period);
+
+	// The bursts: bytes handed over between two pauses. Upstream's group_bytes is
+	// 12 kB, and a shard never spans a group, so a burst is group_bytes rounded up
+	// to a shard boundary.
+	std::vector<size_t> bursts;
+	std::vector<int64_t> gaps;
+	{
+		size_t current = 0;
+		int64_t last_at = run.shards.front().at;
+		for (const CapturedShard & s: run.shards)
+		{
+			if (s.at != last_at)
+			{
+				bursts.push_back(current);
+				gaps.push_back(s.at - last_at);
+				current = 0;
+				last_at = s.at;
+			}
+			current += s.payload.size();
+		}
+		bursts.push_back(current);
+	}
+
+	CHECK(bursts.size() == run.waits.size() + 1);
+
+	bool bursts_sane = true;
+	for (size_t b: bursts)
+	{
+		// No burst is more than one shard past a group, and none is empty.
+		if (b == 0 || b > ShardPacer::group_bytes + data_shard::max_payload_size)
+			bursts_sane = false;
+	}
+	CHECK(bursts_sane);
+
+	// The gap distribution. 4.4 ms over ~18 groups is ~260 us a piece; nothing is
+	// allowed to be shorter than min_sleep_ns (a pause that short is not worth
+	// taking and the pacer must not ask for it) and nothing may be longer than the
+	// whole budget.
+	bool gaps_sane = true;
+	int64_t gap_min = gaps.empty() ? 0 : gaps.front();
+	int64_t gap_max = 0;
+	int64_t gap_total = 0;
+	for (int64_t g: gaps)
+	{
+		if (g < ShardPacer::min_sleep_ns || g > budget)
+			gaps_sane = false;
+		gap_min = std::min(gap_min, g);
+		gap_max = std::max(gap_max, g);
+		gap_total += g;
+	}
+	CHECK(gaps_sane);
+	CHECK(gaps.size() >= 15 && gaps.size() <= 20);
+
+	const int64_t gap_mean = gaps.empty() ? 0 : gap_total / int64_t(gaps.size());
+	CHECK(gap_mean > 200'000 && gap_mean < 320'000);
+	std::printf("  %zu shards + %zu parity in %zu bursts, gaps min %lld us, mean %lld us, max %lld us, "
+	            "frame out in %.2f ms of a %.2f ms window\n",
+	            run.shards.size(),
+	            run.parity.size(),
+	            bursts.size(),
+	            static_cast<long long>(gap_min / 1000),
+	            static_cast<long long>(gap_mean / 1000),
+	            static_cast<long long>(gap_max / 1000),
+	            double(run.finished - run.started) / 1e6,
+	            double(budget) / 1e6);
+
+	// The parity shards travel inside the same bursts as the group they protect,
+	// not in a tail burst of their own.
+	bool parity_interleaved = true;
+	for (const CapturedParity & p: run.parity)
+	{
+		if (p.at > run.finished || p.at < run.started)
+			parity_interleaved = false;
+	}
+	CHECK(parity_interleaved);
+	CHECK(run.parity.size() > 1 && run.parity.front().at < run.parity.back().at);
+
+	// Same bytes, no window: everything leaves at once. This is what an IDR, a
+	// --no-adaptive session and a frame that arrived too late to be paced all get.
+	{
+		PacedRun blast = run_paced(frame, data, start, 0);
+		CHECK(blast.waits.empty());
+		CHECK(blast.finished == start);
+		CHECK(blast.shards.size() == run.shards.size());
+	}
+
+	// A frame smaller than one micro-burst is not worth pacing either.
+	{
+		std::vector<uint8_t> small = make_bitstream(4000, false, 33);
+		PacedRun tiny = run_paced(frame, small, start, budget);
+		CHECK(tiny.waits.empty());
+	}
+
+	// A TCP-only session paces too, which upstream never does: the shards then have
+	// to be cut up even though the socket would take the frame whole.
+	{
+		auto tcp = make_frame_desc(false, false);
+		tcp.fragment_on_control = true;
+		PacedRun tcp_run = run_paced(tcp, data, start, budget);
+		CHECK(tcp_run.shards.size() > 100);
+		CHECK(not tcp_run.waits.empty());
+		CHECK(tcp_run.finished <= start + budget);
+		// Still no parity: nothing on that socket can be lost.
+		CHECK(tcp_run.parity.empty());
+		// And every one of them went to the control socket.
+		bool all_control = true;
+		for (const CapturedShard & s: tcp_run.shards)
+			all_control = all_control && not s.control;
+		// prefer_control is false for a non-IDR frame; the session's sink is what
+		// routes it, and with no stream socket send_stream() falls back to the
+		// control one. What matters here is only that the frame was fragmented.
+		CHECK(all_control);
+	}
+}
+
 } // namespace
 
 int main()
@@ -523,6 +947,8 @@ int main()
 	part_c_serialization();
 	part_d_client_reassembly();
 	part_e_geometry();
+	part_f_fec();
+	part_g_pacing();
 
 	std::printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;

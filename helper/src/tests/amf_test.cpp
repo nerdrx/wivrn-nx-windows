@@ -298,6 +298,65 @@ void part_c_encode()
 	}
 }
 
+// The automatic bitrate controller moves the target under a running encoder,
+// which must not cost a rebuild: no Terminate, no Init, no new parameter set —
+// only the three properties that describe the rate.
+void part_e_runtime_bitrate()
+{
+	std::printf("Part E: runtime bitrate changes\n");
+
+	AmfContext context;
+	CHECK(context.init(nullptr));
+
+	AmfStreamEncoder encoder;
+	CHECK(encoder.open(context, default_params(), "left"));
+
+	g_reset();
+	encoder.set_bitrate(20'000'000);
+
+	std::string r = report();
+	CHECK(has(r, prop("hevc", AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, "int64 20000000")));
+	CHECK(has(r, prop("hevc", AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, "int64 20000000")));
+	// The VBV follows the bitrate: a little over one frame's worth of bits at
+	// 72 Hz, 20 Mbit/s -> 305555.
+	CHECK(has(r, prop("hevc", AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE, "int64 305555")));
+
+	// Nothing else moved, and above all the component was neither re-created nor
+	// re-initialised: that is what would cost an IDR and a stream description.
+	CHECK(not has(r, "hevc.init"));
+	CHECK(not has(r, "hevc.terminate"));
+	CHECK(not has(r, "factory.createcomponent"));
+	CHECK(not has(r, narrow(AMF_VIDEO_ENCODER_HEVC_FRAMESIZE)));
+	CHECK(not has(r, narrow(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET)));
+
+	// The same number twice is not worth a property set.
+	g_reset();
+	encoder.set_bitrate(20'000'000);
+	CHECK(not has(report(), "hevc.set"));
+
+	// And the encoder keeps producing frames across the change.
+	g_reset();
+	std::vector<uint8_t> out;
+	bool idr = false;
+	CHECK(encoder.encode([](void *) { return true; }, false, out, idr) == EncodeResult::ok);
+	CHECK(not out.empty());
+
+	// H.264 takes the AVC spelling of the same three.
+	{
+		AmfEncodeParams params = default_params();
+		params.allow_h265 = false;
+		AmfStreamEncoder avc;
+		CHECK(avc.open(context, params, "left"));
+		g_reset();
+		avc.set_bitrate(33'000'000);
+		const std::string avc_report = report();
+		CHECK(has(avc_report, prop("avc", AMF_VIDEO_ENCODER_TARGET_BITRATE, "int64 33000000")));
+		CHECK(has(avc_report, prop("avc", AMF_VIDEO_ENCODER_PEAK_BITRATE, "int64 33000000")));
+		CHECK(has(avc_report, narrow(AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE)));
+		CHECK(not has(avc_report, "avc.init"));
+	}
+}
+
 void part_d_fallback()
 {
 	std::printf("Part D: the H.264 fallback\n");
@@ -416,6 +475,7 @@ int main()
 	part_b_property_set();
 	part_c_encode();
 	part_d_fallback();
+	part_e_runtime_bitrate();
 
 	std::printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;

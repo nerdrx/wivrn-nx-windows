@@ -30,6 +30,8 @@ public:
 	               const EncoderConfig & config) override;
 	void shutdown() override;
 
+	void set_bitrate(uint32_t bitrate_bps) override;
+
 	EncoderStreamInfo stream_info() const override
 	{
 		return info_;
@@ -50,6 +52,7 @@ private:
 	AmfStreamEncoder encoders_[kStreamCount];
 	EncoderStreamInfo info_{};
 	bool ready_ = false;
+	uint32_t bitrate_bps_ = 0; // whole stream, as last applied
 	uint64_t frames_encoded_ = 0;
 	uint64_t frames_dropped_ = 0;
 };

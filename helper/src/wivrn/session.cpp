@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <variant>
 
@@ -72,6 +73,24 @@ std::string clean_key(const std::string & key)
 	return out;
 }
 
+const char * bitrate_state_name(BitrateController::state_name s)
+{
+	switch (s)
+	{
+		case BitrateController::state_name::off:
+			return "fixed";
+		case BitrateController::state_name::steady:
+			return "steady";
+		case BitrateController::state_name::recovering:
+			return "recovering";
+		case BitrateController::state_name::startup:
+			return "startup ramp";
+		case BitrateController::state_name::probe:
+			return "probing";
+	}
+	return "?";
+}
+
 std::array<uint8_t, 16> random_session_token()
 {
 	std::array<uint8_t, 16> token{};
@@ -101,6 +120,54 @@ sockaddr_in6 peer_of(int fd)
 	if (getpeername(fd, reinterpret_cast<sockaddr *>(&addr), &len) < 0)
 		throw std::system_error{errno, std::generic_category(), "getpeername"};
 	return addr;
+}
+
+// "1.2.3.4:5678" for whichever family the socket really is. sockaddr_storage,
+// because the stream socket is AF_INET for an IPv4 headset and AF_INET6
+// otherwise, and getsockname on the wrong struct silently truncates.
+std::string describe(const sockaddr_storage & ss)
+{
+	char host[INET6_ADDRSTRLEN] = "?";
+	char out[INET6_ADDRSTRLEN + 32];
+
+	if (ss.ss_family == AF_INET)
+	{
+		const auto & sa = reinterpret_cast<const sockaddr_in &>(ss);
+		inet_ntop(AF_INET, &sa.sin_addr, host, sizeof(host));
+		std::snprintf(out, sizeof(out), "%s:%u", host, unsigned(ntohs(sa.sin_port)));
+	}
+	else
+	{
+		const auto & sa = reinterpret_cast<const sockaddr_in6 &>(ss);
+		inet_ntop(AF_INET6, &sa.sin6_addr, host, sizeof(host));
+		std::snprintf(out, sizeof(out), "[%s%%%u]:%u", host, unsigned(sa.sin6_scope_id), unsigned(ntohs(sa.sin6_port)));
+	}
+	return out;
+}
+
+// The one thing a live headset run cannot infer from a packet capture: which
+// local address the video datagrams will carry. The headset's stream socket is
+// connect()ed, so a source address other than the one it dialed is dropped by
+// its kernel and looks exactly like a link that is delivering nothing.
+void log_stream_endpoint(int fd, const char * what)
+{
+	sockaddr_storage local{};
+	socklen_t len = sizeof(local);
+	if (getsockname(fd, reinterpret_cast<sockaddr *>(&local), &len) < 0)
+	{
+		log_line("stream socket %s: getsockname failed (errno %d)", what, errno);
+		return;
+	}
+
+	sockaddr_storage peer{};
+	socklen_t peerlen = sizeof(peer);
+	if (getpeername(fd, reinterpret_cast<sockaddr *>(&peer), &peerlen) < 0)
+	{
+		log_line("stream socket %s: local %s, no peer yet", what, describe(local).c_str());
+		return;
+	}
+
+	log_line("stream socket %s: local %s -> peer %s", what, describe(local).c_str(), describe(peer).c_str());
 }
 
 // wivrn::device_id -> the three devices the IPC contract knows about. Anything
@@ -189,6 +256,28 @@ Session::Session(wivrn::TCP && tcp,
         stop_(stop),
         token_(random_session_token())
 {
+	// The three ways a shard leaves this process. Built once: PacedSender is
+	// driven several times per frame and rebuilding std::functions per burst is
+	// an allocation per burst.
+	sinks_.data = [this](VideoPacketizer::Shard && shard, bool prefer_control) {
+		if (prefer_control)
+			send_control(std::move(shard));
+		else
+			send_stream(std::move(shard));
+	};
+	sinks_.parity = [this](VideoPacketizer::ParityShard && parity) {
+		// Never on the control socket: a parity shard exists to repair a lost
+		// datagram, and nothing is lost on TCP.
+		if (stream_)
+			stream_.send(std::move(parity));
+	};
+	sinks_.stamp = [this](VideoPacketizer::Shard::timing_info_t & timing) {
+		// video_encoder.cpp:589-596: with pacing on, the frame leaves over
+		// several milliseconds, and the headset would otherwise be told it all
+		// left at once.
+		timing.send_end = clock_.get_offset().to_headset(monotonic_ns());
+	};
+
 	handshake();
 }
 
@@ -274,26 +363,70 @@ void Session::handshake()
 	}
 	else
 	{
-		stream_ = decltype(stream_)();
+		// The stream socket must send from the *same local address* the headset
+		// dialed. The headset connect()s its own stream socket to
+		// (address it dialed, stream_port) — client/wivrn_client.cpp:121 and
+		// :173 — and a connected UDP socket only ever accepts datagrams whose
+		// source is exactly that. A datagram sent from any other address of this
+		// machine leaves the NIC looking perfect and is discarded by the
+		// headset's kernel before the app sees a byte of it.
+		//
+		// Upstream gets this for free: server/driver/wivrn_connection.cpp:341
+		// binds the UDP socket to the accepted TCP connection's own local
+		// address, so the source is pinned whatever the routing table thinks.
+		// This port used to bind the wildcard instead, which hands the choice
+		// back to Windows' route lookup — right on a single-homed machine, wrong
+		// the moment a second adapter (a second NIC, Wi-Fi beside Ethernet, a
+		// VPN, a Hyper-V/WSL virtual switch) can also reach the headset.
+		//
+		// The reason the wildcard was there: wivrn::UDP always opens AF_INET6,
+		// and on Windows an AF_INET6 socket bound to a specific ::ffff:a.b.c.d
+		// refuses a later connect() to an IPv4-mapped peer with
+		// WSAEADDRNOTAVAIL. The fix is not to widen the bind but to open the
+		// socket in the family the peer really is: a plain AF_INET socket bound
+		// to a.b.c.d:port when the headset is IPv4, the usual AF_INET6 one
+		// otherwise. wivrn::UDP(int fd) adopts a descriptor made out here, so
+		// none of this has to reach common/.
+		const bool client_is_v4 = IN6_IS_ADDR_V4MAPPED(&client_address.sin6_addr) != 0;
 
-		// wivrn::UDP opens an AF_INET6 socket; Winsock defaults IPV6_V6ONLY to
-		// on, where Linux defaults it off. Without this the socket could
-		// neither be bound to the IPv4-mapped local address an IPv4 headset's
-		// TCP connection landed on, nor receive that headset's datagrams. Must
-		// precede bind(), which is why it cannot live inside common/.
-		int v6only = 0;
-		if (setsockopt(stream_.get_fd(), IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0)
-			log_line("warning: could not clear IPV6_V6ONLY on the stream socket (errno %d)", errno);
+		if (client_is_v4)
+		{
+			// socket() is the shadow macro: it clears SIO_UDP_CONNRESET, which
+			// an ICMP unreachable from a headset that went away would otherwise
+			// turn into a fatal receive error.
+			const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+			if (fd < 0)
+				throw std::system_error{errno, std::generic_category(), "stream socket"};
 
-		// Bind to the wildcard address on the stream port, NOT to the specific
-		// IPv4-mapped local address the TCP control connection landed on. On
-		// Windows a dual-stack UDP socket bound to a specific ::ffff:a.b.c.d
-		// local address then refuses connect() to an IPv4-mapped peer with
-		// WSAEADDRNOTAVAIL; binding to the wildcard lets the later connect()
-		// to the client's mapped address succeed. Linux tolerates either.
-		sockaddr_in6 bind_address = server_address;
-		bind_address.sin6_addr = in6addr_any;
-		stream_.bind(bind_address);
+			stream_ = decltype(stream_)(fd);
+
+			sockaddr_in bind_address{};
+			bind_address.sin_family = AF_INET;
+			bind_address.sin_port = server_address.sin6_port;
+			// The last four bytes of a v4-mapped ::ffff:a.b.c.d are a.b.c.d.
+			std::memcpy(&bind_address.sin_addr, server_address.sin6_addr.s6_addr + 12, 4);
+
+			if (::bind(stream_.get_fd(), reinterpret_cast<sockaddr *>(&bind_address), sizeof(bind_address)) < 0)
+				throw std::system_error{errno, std::generic_category(), "stream bind"};
+		}
+		else
+		{
+			stream_ = decltype(stream_)();
+
+			// Winsock defaults IPV6_V6ONLY to on, where Linux defaults it off.
+			// Nothing v4-mapped reaches this branch any more, but a dual-stack
+			// socket is still what the rest of the code assumes it has. Must
+			// precede bind(), which is why it cannot live inside common/.
+			int v6only = 0;
+			if (setsockopt(stream_.get_fd(), IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0)
+				log_line("warning: could not clear IPV6_V6ONLY on the stream socket (errno %d)", errno);
+
+			// Exactly what upstream binds: the accepted connection's own local
+			// address, scope id and all.
+			stream_.bind(server_address);
+		}
+
+		log_stream_endpoint(stream_.get_fd(), "bound");
 	}
 
 	// --- crypto handshake ------------------------------------------------
@@ -414,18 +547,35 @@ void Session::handshake()
 		         client_address.sin6_scope_id,
 		         client_port);
 
-		// wivrn::UDP::connect(in6_addr, port) drops sin6_scope_id, which a
-		// link-local peer address (fe80::...) cannot survive: connect() then
-		// fails with EADDRNOTAVAIL because the kernel cannot pick the
-		// interface. The headset dials whichever of our mDNS addresses it
-		// likes — including link-local — so connect with the full sockaddr
-		// of the accepted TCP connection, scope id and all.
-		sockaddr_in6 sa = client_address;
-		sa.sin6_port = htons(static_cast<uint16_t>(client_port));
-		if (::connect(stream_.get_fd(), reinterpret_cast<sockaddr *>(&sa), sizeof(sa)) < 0)
-			throw std::system_error{errno, std::generic_category(), "stream connect"};
+		if (IN6_IS_ADDR_V4MAPPED(&client_address.sin6_addr))
+		{
+			// The socket is AF_INET (see the bind above), so it takes an
+			// AF_INET peer. Same address the TCP control connection came from,
+			// with the UDP port the headset just told us about.
+			sockaddr_in sa{};
+			sa.sin_family = AF_INET;
+			sa.sin_port = htons(static_cast<uint16_t>(client_port));
+			std::memcpy(&sa.sin_addr, client_address.sin6_addr.s6_addr + 12, 4);
+
+			if (::connect(stream_.get_fd(), reinterpret_cast<sockaddr *>(&sa), sizeof(sa)) < 0)
+				throw std::system_error{errno, std::generic_category(), "stream connect"};
+		}
+		else
+		{
+			// wivrn::UDP::connect(in6_addr, port) drops sin6_scope_id, which a
+			// link-local peer address (fe80::...) cannot survive: connect() then
+			// fails with EADDRNOTAVAIL because the kernel cannot pick the
+			// interface. The headset dials whichever of our mDNS addresses it
+			// likes — including link-local — so connect with the full sockaddr
+			// of the accepted TCP connection, scope id and all.
+			sockaddr_in6 sa = client_address;
+			sa.sin6_port = htons(static_cast<uint16_t>(client_port));
+			if (::connect(stream_.get_fd(), reinterpret_cast<sockaddr *>(&sa), sizeof(sa)) < 0)
+				throw std::system_error{errno, std::generic_category(), "stream connect"};
+		}
+
 		stream_.set_send_buffer_size(1024 * 1024 * 5);
-		log_line("stream socket connected, client UDP port %d", client_port);
+		log_stream_endpoint(stream_.get_fd(), "connected");
 	}
 	else
 	{
@@ -491,6 +641,7 @@ void Session::on_headset_info(const wivrn::from_headset::headset_info_packet & i
 
 	publish_config();
 	publish_video_request();
+	configure_transport();
 }
 
 void Session::on_settings(const wivrn::from_headset::settings_changed & settings)
@@ -509,6 +660,35 @@ void Session::on_settings(const wivrn::from_headset::settings_changed & settings
 		// A different frame rate is a different encoder: the rate control law and
 		// the VBV are both sized from it.
 		publish_video_request();
+	}
+
+	// The headset's own transport switches, live (wivrn_session.cpp:530-558). Each
+	// one is only obeyed while --no-adaptive is not in force; turning the automatic
+	// bitrate off on the headset restores the full ceiling, which is what
+	// set_client_enabled returns.
+	info_.settings = settings;
+
+	const bool adaptive = video_.prefs().adaptive;
+	bitrate_.set_radio_aware(adaptive and settings.radio_aware);
+	apply_bitrate(bitrate_.set_client_enabled(adaptive and settings.bitrate_auto));
+	apply_bitrate(bitrate_.set_client_mode(settings.bitrate_control));
+
+	const bool pacing = adaptive and settings.smooth_pacing;
+	if (pacing != pacing_enabled_)
+	{
+		pacing_enabled_ = pacing;
+		pacing_slot_.reset();
+		bitrate_.set_pacing_window(pacing ? std::min(pacing_window_, ShardPacer::max_window) : 0.f);
+		log_line("video: shard pacing %s by the headset", pacing ? "enabled" : "disabled");
+	}
+
+	const bool fec = adaptive and settings.fec and static_cast<bool>(stream_);
+	if (fec != fec_enabled_)
+	{
+		fec_enabled_ = fec;
+		// The encoder's share of the link changes with it (fec::data_share).
+		apply_bitrate(bitrate_.current());
+		log_line("video: forward error correction %s", fec ? "enabled" : "disabled");
 	}
 }
 
@@ -697,18 +877,80 @@ void Session::update_stream_description()
 	         static_cast<double>(refresh_hz_));
 }
 
-void Session::send_video_frame(EncodedFrame & frame)
+void Session::configure_transport()
 {
+	const VideoBridge::Prefs prefs = video_.prefs();
+	const auto & settings = info_.settings;
+
+	// --bitrate is the ceiling the controller works below, and --no-adaptive is
+	// the server side switch for the whole transport stack: no controller, no
+	// pacing, no parity, i.e. exactly the fixed-CBR behaviour this port had
+	// before, which is what makes an A/B run mean something.
+	BitrateController::config cfg{};
+	cfg.enabled = prefs.adaptive;
+
+	bitrate_.configure(cfg,
+	                   prefs.ceiling_bps,
+	                   settings.bitrate_auto,
+	                   settings.radio_aware,
+	                   settings.bitrate_control);
+
+	// Both switches, same as the bitrate (wivrn_session.cpp:945-952).
+	pacing_enabled_ = prefs.adaptive and settings.smooth_pacing;
+	pacing_slot_.reset();
+	// The estimator needs to know the window to tell a frame that filled it from
+	// one that was over in a single micro-burst; 0 means "not paced".
+	bitrate_.set_pacing_window(pacing_enabled_ ? std::min(pacing_window_, ShardPacer::max_window) : 0.f);
+
+	// Parity repairs datagrams, and there are no datagrams to lose on a TCP-only
+	// session — every shard of it arrives or the connection is over. On the Linux
+	// server the same test is video_encoder.cpp:563.
+	fec_enabled_ = prefs.adaptive and settings.fec and static_cast<bool>(stream_);
+
+	log_line("video transport: bitrate ceiling %.1f Mbit/s (%s), pacing %s%s, FEC %s%s",
+	         prefs.ceiling_bps * 1e-6,
+	         prefs.adaptive ? (settings.bitrate_auto ? "adaptive" : "headset asked for fixed") : "--no-adaptive",
+	         pacing_enabled_ ? "on" : "off",
+	         pacing_enabled_ ? (stream_ ? " (UDP)" : " (TCP control socket)") : "",
+	         fec_enabled_ ? "on" : "off",
+	         (not fec_enabled_ and prefs.adaptive and settings.fec and not stream_) ? " (TCP-only session, nothing to repair)" : "");
+
+	apply_bitrate(bitrate_.current());
+}
+
+void Session::apply_bitrate(std::optional<uint32_t> bitrate_bps)
+{
+	if (not bitrate_bps or *bitrate_bps == 0)
+		return;
+
+	// video_encoder.cpp:365-378. The number the controller decides is a budget for
+	// the link, and the parity shards are on that link too: an encoder left at the
+	// full number would put 12.5% more than the budget on the wire with FEC on, and
+	// the controller would then spend its time chasing the loss it caused itself.
+	const double share = fec_enabled_ ? wivrn::fec::data_share : 1.0;
+	video_.set_bitrate(static_cast<uint32_t>(double(*bitrate_bps) * share));
+}
+
+bool Session::begin_video_frame(int64_t now_ns)
+{
+	EncodedFrame & frame = video_queue_.front();
+	if (frame.data.empty())
+		return false;
+
 	const ClockOffset offset = clock_.get_offset();
 	const int64_t present_ns = qpc_to_ns(frame.sample_time_qpc);
 	const int64_t photon_ns = present_ns + static_cast<int64_t>(static_cast<double>(frame.predict_s) * 1e9);
-	const int64_t now_ns = monotonic_ns();
 
 	VideoPacketizer::Frame out{};
 	out.stream_index = frame.stream_index;
 	out.frame_index = frame.frame_id;
 	out.idr = frame.idr;
 	out.has_stream_socket = static_cast<bool>(stream_);
+	// A TCP-only session is only worth cutting into shards if the pieces are then
+	// spread out; otherwise the whole frame in one write is both cheaper and what
+	// this port did before.
+	out.fragment_on_control = pacing_enabled_ and not stream_;
+	out.fec = fec_enabled_;
 
 	// server/compositor/compositor.cpp:635 puts the *predicted display time* here,
 	// converted into the headset's clock. FrameReady gives the two halves of that
@@ -747,54 +989,125 @@ void Session::send_video_frame(EncodedFrame & frame)
 	// as the moment the frame was presented, which is the earliest point in this
 	// pipeline that means anything; the rest are now, because the encode and the
 	// send happen on two different threads and the timestamps would otherwise
-	// have to be carried across the bridge for a HUD.
+	// have to be carried across the bridge for a HUD. send_end is re-stamped on
+	// the last shard, see the Sinks::stamp hook below.
 	out.timing_info.encode_begin = offset.to_headset(present_ns);
 	out.timing_info.encode_end = offset.to_headset(now_ns);
 	out.timing_info.send_begin = offset.to_headset(now_ns);
 	out.timing_info.send_end = offset.to_headset(now_ns);
 
+	// The pacing budget for this frame: whatever is left of the slot's window,
+	// divided by the frames already queued behind this one (shard_pacer.h:175-193).
+	// Not for an IDR, which the session and the headset are both waiting on.
+	int64_t budget = 0;
+	if (pacing_enabled_ and not frame.idr)
+		budget = pacing_slot_.begin_frame(now_ns,
+		                                  frame_period_ns(),
+		                                  pacing_window_,
+		                                  video_queue_.size() - 1);
+
 	// Mutable, and not incidentally: video_stream_data_shard::payload is a
 	// std::span<uint8_t> and the socket encrypts through it in place
 	// (common/wivrn_sockets.cpp:410). Each shard covers a disjoint stretch of
 	// this buffer and each goes out once, so encrypting one does not disturb the
-	// next - but the buffer is consumed by this call and must not be reused.
-	std::span<uint8_t> data(frame.data);
+	// next - but the buffer is consumed and must not be reused, which is why the
+	// frame is dropped from the queue as soon as it is finished.
+	sender_.begin(out,
+	              std::span<uint8_t>(frame.data),
+	              ShardPacer(now_ns, budget, frame.data.size()));
+	return true;
+}
 
-	uint16_t shards = 0;
-	try
-	{
-		shards = VideoPacketizer::send(
-		        out,
-		        data,
-		        [this](VideoPacketizer::Shard && shard, bool prefer_control) {
-			        if (prefer_control)
-				        send_control(std::move(shard));
-			        else
-				        send_stream(std::move(shard));
-		        });
-	}
-	catch (const std::exception &)
-	{
-		// A frame lost to a socket error is one frame; the session's own poll
-		// loop is what decides the connection is over.
-		++video_send_errors_;
-		return;
-	}
+void Session::finish_video_frame()
+{
+	const EncodedFrame & frame = video_queue_.front();
 
 	++video_frames_sent_;
-	video_shards_sent_ += shards;
-	video_bytes_sent_ += frame.data.size();
+	video_shards_sent_ += sender_.shards();
+	video_parity_sent_ += sender_.parity_shards();
+	video_bytes_sent_ += sender_.wire_bytes();
 	idr_.on_frame_sent(frame.frame_id, frame.idr);
+
+	// Everything that left for this frame of this stream, parity included: the unit
+	// the delivered-bandwidth estimator divides by the headset's receive span
+	// (bitrate_controller.h:411-416, video_encoder.cpp:697).
+	bitrate_.on_frame_bytes(frame.frame_id, frame.stream_index, sender_.wire_bytes());
+
+	video_queue_.pop_front();
 }
 
 void Session::pump_video()
 {
 	video_scratch_.clear();
-	if (video_.take_frames(video_scratch_) == 0)
-		return;
+	if (video_.take_frames(video_scratch_) > 0)
+	{
+		for (EncodedFrame & frame: video_scratch_)
+			video_queue_.push_back(std::move(frame));
 
-	for (EncodedFrame & frame: video_scratch_)
-		send_video_frame(frame);
+		// The queue is bounded here as well as in the bridge: a pacer that fell
+		// behind (a stalled socket, a frame period that shrank) must not let it
+		// grow. Oldest first, by whole frames, and never the one the sender is
+		// working through — half a frame pair is worth nothing to a headset that
+		// joins the two streams on a common frame index (video_bridge.cpp:115-123).
+		while (video_queue_.size() > kMaxVideoQueued)
+		{
+			const size_t first = sender_.active() ? 1 : 0;
+			if (video_queue_.size() <= first)
+				break;
+
+			const uint64_t victim = video_queue_[first].frame_id;
+			while (video_queue_.size() > first && video_queue_[first].frame_id == victim)
+			{
+				video_queue_.erase(video_queue_.begin() + long(first));
+				++video_frames_dropped_;
+			}
+		}
+	}
+
+	const int64_t now = monotonic_ns();
+	next_video_due_ = 0;
+
+	for (;;)
+	{
+		if (not sender_.active())
+		{
+			if (video_queue_.empty())
+				return;
+			if (not begin_video_frame(now))
+			{
+				// A frame with no bytes: nothing to send, nothing to book.
+				video_queue_.pop_front();
+				continue;
+			}
+		}
+
+		int64_t due = 0;
+		try
+		{
+			due = sender_.pump(now, sinks_);
+		}
+		catch (const std::exception &)
+		{
+			// A frame lost to a socket error is one frame; the session's own poll
+			// loop is what decides the connection is over. The rest of it is
+			// worthless — the headset can never complete a frame it has holes in.
+			sender_.abort();
+			++video_send_errors_;
+			video_queue_.pop_front();
+			continue;
+		}
+
+		if (due > now)
+		{
+			// The next micro-burst is not due yet. Back to the loop, which will
+			// poll() for at most that long.
+			next_video_due_ = due;
+			return;
+		}
+
+		if (not sender_.active())
+			finish_video_frame();
+	}
 }
 
 void Session::on_feedback(const wivrn::from_headset::feedback & feedback)
@@ -815,11 +1128,18 @@ void Session::on_feedback(const wivrn::from_headset::feedback & feedback)
 		         feedback.displayed != 0);
 	}
 
-	if (idr_.on_feedback(feedback))
+	const auto now = clock::now();
+
+	if (idr_.on_feedback(feedback, now))
 	{
 		video_.request_idr("headset lost a frame");
 		++idr_requests_;
 	}
+
+	// Both ends of the frame delivery timings are in the headset clock, so this
+	// needs no clock offset and works from the first frame of a session
+	// (wivrn_session.cpp:963-965).
+	apply_bitrate(bitrate_.on_feedback(feedback, frame_period_ns(), true, now));
 }
 
 void Session::send_tracking_pattern()
@@ -1037,15 +1357,28 @@ void Session::run()
 			        publish_video_request();
 		        }
 	        },
+	        [this](wivrn::from_headset::wifi_state && packet) {
+		        // The leading indicator: the radio starts falling a second or two
+		        // before the rate adaptation gives up and the first packet is lost.
+		        // A sample the headset could not take says nothing; the controller
+		        // ages the last usable one out on its own after a few seconds
+		        // (wivrn_session.cpp:991-999).
+		        if (not packet.valid)
+		        {
+			        ++discarded_packets_;
+			        return;
+		        }
+		        apply_bitrate(bitrate_.on_wifi_state(packet.rssi_dbm, packet.link_speed_mbps));
+	        },
 	        [this](wivrn::from_headset::path_ping && packet) {
 		        // The keepalive on a secondary path. There is no secondary path
 		        // here, but echoing it costs nothing and keeps a client that
 		        // probed the USB tunnel from waiting on a reply.
 		        send_control(wivrn::to_headset::path_pong{packet.path_id, packet.timestamp});
 	        },
-	        // Everything else - audio, hand/body/face tracking, battery, Wi-Fi
-	        // state, the application list, HID forwarding - has no consumer in
-	        // this phase and is read and dropped so the socket never backs up.
+	        // Everything else - audio, hand/body/face tracking, battery, the
+	        // application list, HID forwarding - has no consumer in this phase and
+	        // is read and dropped so the socket never backs up.
 	        [this](auto &&) { ++discarded_packets_; },
 	};
 
@@ -1081,7 +1414,21 @@ void Session::run()
 		fds[1].fd = control_.get_fd();
 		fds[1].events = POLLIN;
 
-		const int r = ::poll(fds, 2, 20);
+		// 20 ms unless a paced micro-burst is due before that. This is the whole
+		// of the pacing "sleep": the thread waits on the sockets rather than on a
+		// timer, so a tracking packet that arrives mid-frame is still processed the
+		// moment it lands and the poses the pipe server publishes never wait on
+		// video. Rounded up, so a burst is never handed over early; a 0 ms poll
+		// would spin.
+		int timeout_ms = 20;
+		if (next_video_due_ != 0)
+		{
+			const int64_t wait_ns = next_video_due_ - monotonic_ns();
+			const int64_t wait_ms = wait_ns <= 0 ? 0 : (wait_ns + 999'999) / 1'000'000;
+			timeout_ms = int(std::clamp<int64_t>(wait_ms, 0, 20));
+		}
+
+		const int r = ::poll(fds, 2, timeout_ms);
 		if (r < 0)
 		{
 			log_line("session ended: poll failed (errno %d)", errno);
@@ -1124,6 +1471,13 @@ void Session::run()
 
 			pump_haptics();
 
+			// A recovery IDR the tracker held back for min_recovery_interval.
+			if (idr_.poll(now))
+			{
+				video_.request_idr("headset lost a frame (held back by the IDR floor)");
+				++idr_requests_;
+			}
+
 			// Video last of the three: a frame is orders of magnitude more bytes
 			// than a timesync query or a haptic pulse, and putting it in front of
 			// them would delay the clock estimate the frame's own timestamps
@@ -1154,14 +1508,33 @@ void Session::run()
 			                                         sanitizers_[1].frozen() +
 			                                         sanitizers_[2].frozen()));
 
-			log_line("video: %llu eye-frames sent in %llu shards (%llu kB), %llu send errors, "
-			         "%llu IDRs requested, %llu frames dropped in the queue",
+			log_line("video: %llu eye-frames sent in %llu shards + %llu parity (%llu kB), "
+			         "%llu send errors, %llu IDRs requested (%llu held back), "
+			         "%llu frames dropped in the queue",
 			         static_cast<unsigned long long>(video_frames_sent_),
 			         static_cast<unsigned long long>(video_shards_sent_),
+			         static_cast<unsigned long long>(video_parity_sent_),
 			         static_cast<unsigned long long>(video_bytes_sent_ / 1024),
 			         static_cast<unsigned long long>(video_send_errors_),
 			         static_cast<unsigned long long>(idr_requests_),
-			         static_cast<unsigned long long>(video_.frames_dropped_in_queue()));
+			         static_cast<unsigned long long>(idr_.damped()),
+			         static_cast<unsigned long long>(video_.frames_dropped_in_queue() + video_frames_dropped_));
+
+			// The controller logs every decision it takes; this is the "nothing
+			// happened for five seconds" line that says what it settled on.
+			const BitrateController::status bitrate = bitrate_.snapshot();
+			char estimate[64] = "";
+			if (bitrate.estimate_bps != 0)
+				std::snprintf(estimate,
+				              sizeof(estimate),
+				              ", link measured at %.1f Mbit/s",
+				              bitrate.estimate_bps * 1e-6);
+			log_line("video: bitrate %.1f of %.1f Mbit/s, %s%s%s",
+			         bitrate.bitrate_bps * 1e-6,
+			         bitrate.ceiling_bps * 1e-6,
+			         bitrate_state_name(bitrate.state),
+			         bitrate.radio_hold ? ", radio hold" : "",
+			         estimate);
 		}
 	}
 }

@@ -394,6 +394,34 @@ bool AmfStreamEncoder::configure_h264(const AmfEncodeParams & params)
 	return true;
 }
 
+void AmfStreamEncoder::set_bitrate(uint32_t bitrate_bps)
+{
+	if (component_ == nullptr || bitrate_bps == 0 || bitrate_bps == params_.bitrate_bps)
+		return;
+
+	params_.bitrate_bps = bitrate_bps;
+
+	const amf_int64 bitrate = bitrate_bps;
+	const amf_int32 fps = static_cast<amf_int32>(params_.refresh_hz > 1.f ? params_.refresh_hz : 90.f);
+	// The same VBV the two configure_* functions size at Init time: a little over
+	// one frame's worth of bits (amf_encoder.cpp configure_h265/h264, from ALVR's
+	// VideoEncoderAMF.cpp:299 and :461).
+	const amf_int64 vbv = static_cast<amf_int64>(static_cast<double>(bitrate) / fps * 1.1);
+
+	if (codec_ == VideoCodec::h265)
+	{
+		component_->SetProperty(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, bitrate);
+		component_->SetProperty(AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, bitrate);
+		component_->SetProperty(AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE, vbv);
+	}
+	else
+	{
+		component_->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, bitrate);
+		component_->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, bitrate);
+		component_->SetProperty(AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, vbv);
+	}
+}
+
 void AmfStreamEncoder::close()
 {
 	if (component_ != nullptr)

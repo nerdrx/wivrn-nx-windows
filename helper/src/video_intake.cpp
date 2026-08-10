@@ -227,6 +227,9 @@ void VideoIntake::ensure_encoder(const ipc::StagingConfig & config, uint32_t vrs
 	encoder_generation_ = config.generation;
 	encoder_config_generation_ = request.config_generation;
 	idr_seen_ = 0; // a brand new encoder owes the client a parameter set
+	// configure() was given request.bitrate_bps, so the components already carry
+	// this generation's bitrate.
+	bitrate_seen_ = request.bitrate_generation;
 
 	const EncoderStreamInfo info = encoder_->stream_info();
 	bridge_.publish_stream(info, true);
@@ -264,6 +267,14 @@ void VideoIntake::encode_one(const ipc::FrameReady & frame)
 		push_done(frame.frame_id, frame.staging_index, kDoneDropped);
 		++frames_dropped_;
 		return;
+	}
+
+	// The automatic bitrate moved: hand the new target to the running components
+	// before this frame is encoded. No rebuild, see AmfStreamEncoder::set_bitrate.
+	if (request.bitrate_generation != bitrate_seen_)
+	{
+		bitrate_seen_ = request.bitrate_generation;
+		encoder_->set_bitrate(request.bitrate_bps);
 	}
 
 	const bool force_idr = request.idr_generation != idr_seen_;

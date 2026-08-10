@@ -55,7 +55,13 @@ bool AmfVideoEncoder::configure(const ipc::StagingConfig & staging,
 	params.width = eye_width;
 	params.height = eye_height;
 	params.refresh_hz = config.refresh_hz;
-	params.bitrate_bps = config.bitrate_bps;
+	// Per component, and this is a fix rather than a rename: the two eyes were
+	// both configured at the full number, so a --bitrate 50 session actually put
+	// 100 Mbit/s of CBR video on the link. The bitrate the controller decides is
+	// a budget for the link (server/encoder/video_encoder.cpp:365-378 divides the
+	// same way, through bitrate_multiplier), and the utilisation it measures comes
+	// from what the headset receives — both eyes.
+	params.bitrate_bps = config.bitrate_bps / kStreamCount;
 	params.surface_format = surface_format;
 	params.allow_h265 = config.allow_h265;
 	params.allow_h264 = config.allow_h264;
@@ -86,9 +92,22 @@ bool AmfVideoEncoder::configure(const ipc::StagingConfig & staging,
 
 	info_ = EncoderStreamInfo{eye_width, eye_height, encoders_[0].codec()};
 	ready_ = true;
+	bitrate_bps_ = config.bitrate_bps;
 	frames_encoded_ = 0;
 	frames_dropped_ = 0;
 	return true;
+}
+
+void AmfVideoEncoder::set_bitrate(uint32_t bitrate_bps)
+{
+	// Called from the intake thread, between two encodes, which is also the only
+	// thread that touches the components.
+	if (not ready_ or bitrate_bps == 0 or bitrate_bps == bitrate_bps_)
+		return;
+
+	bitrate_bps_ = bitrate_bps;
+	for (AmfStreamEncoder & e: encoders_)
+		e.set_bitrate(bitrate_bps / kStreamCount);
 }
 
 void AmfVideoEncoder::shutdown()
@@ -100,6 +119,7 @@ void AmfVideoEncoder::shutdown()
 	stage_.destroy_device();
 	info_ = EncoderStreamInfo{};
 	ready_ = false;
+	bitrate_bps_ = 0;
 }
 
 EncodeResult AmfVideoEncoder::encode(const ipc::FrameReady & frame,

@@ -92,6 +92,8 @@ private:
 	uint32_t encoder_generation_ = 0;
 	uint64_t encoder_config_generation_ = 0;
 	uint64_t idr_seen_ = 0;
+	// Last VideoRequest::bitrate_generation applied to the live encoder.
+	uint64_t bitrate_seen_ = 0;
 
 	uint64_t frames_seen_ = 0;
 	uint64_t frames_encoded_ = 0;

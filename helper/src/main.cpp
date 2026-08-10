@@ -54,6 +54,7 @@
 #include "wivrn/server.h"
 #include "wivrn/session.h"
 #include "wivrn/store.h"
+#include "wivrn/synthetic_video.h"
 #endif
 
 #ifndef WIVRNNX_DISPLAY_VERSION
@@ -116,6 +117,13 @@ struct Options
 	std::string instance_name;
 	uint32_t bitrate_mbps = 50;
 	int codec = 0; // 0 auto, 1 h264, 2 h265
+	// The whole adaptive transport stack: bitrate control, shard pacing and
+	// forward error correction. Off pins the fixed-CBR unpaced behaviour, which is
+	// what an A/B run against it needs.
+	bool adaptive = true;
+	// Test harness only: synthesize the video stream instead of encoding one, so
+	// that the transport can be driven without a GPU. See wivrn/synthetic_video.h.
+	bool synthetic_video = false;
 	wivrnnx::helper::ServerOptions server;
 };
 
@@ -132,7 +140,12 @@ void usage()
 	        "  --tcp-only         no UDP stream socket, everything on the control connection\n"
 	        "  --no-mdns          do not announce the service; the headset must connect by address\n"
 	        "  --codec C          force the video codec: h264 or h265 (default: prefer h265)\n"
-	        "  --bitrate N        video bitrate in Mbit/s (default 50)\n"
+	        "  --bitrate N        video bitrate ceiling in Mbit/s (default 50); the automatic\n"
+	        "                     control works below it and never above\n"
+	        "  --no-adaptive      pin the bitrate to --bitrate and turn off shard pacing and\n"
+	        "                     forward error correction\n"
+	        "  --synthetic-video  test harness: stream generated frames instead of encoding\n"
+	        "                     what SteamVR presents (no GPU, no shim)\n"
 	        "  --name NAME        service instance name (default: this computer's name)\n"
 	        "  --help             this text\n",
 	        wivrnnx::helper::ServerOptions{}.port);
@@ -160,6 +173,10 @@ bool parse_args(int argc, char ** argv, Options & options, bool & ok)
 			options.fake = true;
 		else if (arg == "--no-mdns")
 			options.mdns = false;
+		else if (arg == "--no-adaptive")
+			options.adaptive = false;
+		else if (arg == "--synthetic-video")
+			options.synthetic_video = true;
 		else if (arg == "--tcp-only")
 			options.server.tcp_only = true;
 		else if (arg == "--no-pairing")
@@ -306,9 +323,26 @@ int main(int argc, char ** argv)
 	// connected and the shim has sent a staging ring, which is what keeps
 	// --fake (and a machine with no Radeon) entirely out of the GPU.
 	VideoBridge video_bridge;
-	video_bridge.set_prefs(options.bitrate_mbps * 1'000'000u, options.codec);
-	VideoIntake video_intake(video_bridge, std::make_unique<AmfVideoEncoder>());
+	video_bridge.set_prefs(options.bitrate_mbps * 1'000'000u, options.codec, options.adaptive);
+	// --synthetic-video answers every FrameReady with "dropped" (a null encoder)
+	// and feeds the bridge from the generator instead: the two must never both be
+	// producing frames for the same stream.
+	VideoIntake video_intake(video_bridge,
+	                         options.synthetic_video
+	                                 ? nullptr
+	                                 : std::unique_ptr<IVideoEncoder>(std::make_unique<AmfVideoEncoder>()));
 	video_intake.start();
+
+#ifdef WIVRNNX_HAVE_WIVRN
+	std::optional<SyntheticVideo> synthetic;
+	if (options.synthetic_video)
+	{
+		// A Pico 4 render size, which is what the description would carry anyway;
+		// nothing decodes these frames.
+		synthetic.emplace(video_bridge, 1600, 1760);
+		synthetic->start();
+	}
+#endif
 
 	std::thread mdns_thread;
 	std::thread wivrn_thread;
@@ -395,6 +429,10 @@ int main(int argc, char ** argv)
 	// Before the WiVRn thread is joined: the intake's thread may be mid-encode
 	// and the session's ~Session is what tells it to stop wanting frames.
 	video_intake.stop();
+#ifdef WIVRNNX_HAVE_WIVRN
+	if (synthetic)
+		synthetic->stop();
+#endif
 
 	if (fake_thread.joinable())
 		fake_thread.join();

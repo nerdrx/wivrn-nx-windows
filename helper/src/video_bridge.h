@@ -33,7 +33,12 @@ struct VideoRequest
 	// nothing touches the GPU.
 	bool active = false;
 	float refresh_hz = 90.f;
+	// What the encoder should be producing right now. With the automatic bitrate
+	// on this moves under the session's feet, which is what bitrate_generation is
+	// for: the encoder thread applies it to the live AMF components without
+	// rebuilding them (a rebuild would cost an IDR and a stream description).
 	uint32_t bitrate_bps = 50'000'000;
+	uint64_t bitrate_generation = 0;
 	bool allow_h265 = true;
 	bool allow_h264 = true;
 
@@ -63,8 +68,23 @@ public:
 
 	// Process-wide overrides from the command line, applied on top of whatever
 	// the client negotiates in set_client(). codec: 0 = auto, 1 = force H.264,
-	// 2 = force HEVC. Call once at startup, before any client connects.
-	void set_prefs(uint32_t bitrate_bps, int codec);
+	// 2 = force HEVC. `adaptive` is --no-adaptive read the right way up. Call
+	// once at startup, before any client connects.
+	void set_prefs(uint32_t bitrate_bps, int codec, bool adaptive);
+
+	// What the command line asked for. The bitrate is a *ceiling*: the automatic
+	// control works below it and never above.
+	struct Prefs
+	{
+		uint32_t ceiling_bps = 50'000'000;
+		int codec = 0;
+		bool adaptive = true;
+	};
+	Prefs prefs() const;
+
+	// The bitrate the controller decided, in bits per second on the wire for both
+	// eyes together. Applied to the running encoder, no rebuild.
+	void set_bitrate(uint32_t bitrate_bps);
 
 	// Drains everything the encoder has produced. Appends; returns how many.
 	size_t take_frames(std::vector<EncodedFrame> & out);
@@ -100,6 +120,7 @@ private:
 	VideoRequest request_{};
 	uint32_t pref_bitrate_bps_ = 50'000'000;
 	int pref_codec_ = 0;
+	bool pref_adaptive_ = true;
 	StreamState stream_{};
 	std::deque<EncodedFrame> frames_;
 	uint64_t frames_queued_ = 0;
