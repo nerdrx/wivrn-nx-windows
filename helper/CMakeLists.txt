@@ -19,6 +19,7 @@ set(WIVRNNX_HELPER_SOURCES
     src/video_intake.cpp
     src/encoder/amf_loader.cpp
     src/encoder/amf_encoder.cpp
+    src/encoder/amf_probe.cpp
     src/encoder/amf_video_encoder.cpp
     src/encoder/d3d11_stage.cpp
 )

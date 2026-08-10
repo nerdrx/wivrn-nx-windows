@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "bridge.h"
+#include "encoder/amf_probe.h"
 #include "encoder/amf_video_encoder.h"
 #include "fake_tracker.h"
 #include "log.h"
@@ -112,6 +113,7 @@ struct ServerOptions
 struct Options
 {
 	bool fake = false;
+	bool amf_probe = false;
 	bool mdns = true;
 	std::string instance_name;
 	uint32_t bitrate_mbps = 50;
@@ -133,6 +135,7 @@ void usage()
 	        "  --no-mdns          do not announce the service; the headset must connect by address\n"
 	        "  --codec C          force the video codec: h264 or h265 (default: prefer h265)\n"
 	        "  --bitrate N        video bitrate in Mbit/s (default 50)\n"
+	        "  --amf-probe        run the AMF encoder-init diagnostic and exit\n"
 	        "  --name NAME        service instance name (default: this computer's name)\n"
 	        "  --help             this text\n",
 	        wivrnnx::helper::ServerOptions{}.port);
@@ -158,6 +161,8 @@ bool parse_args(int argc, char ** argv, Options & options, bool & ok)
 
 		if (arg == "--fake")
 			options.fake = true;
+		else if (arg == "--amf-probe")
+			options.amf_probe = true;
 		else if (arg == "--no-mdns")
 			options.mdns = false;
 		else if (arg == "--tcp-only")
@@ -252,6 +257,13 @@ int main(int argc, char ** argv)
 	bool ok = true;
 	if (!parse_args(argc, argv, options, ok))
 		return ok ? 0 : 1;
+
+	// Before any WiVRn/network setup: the probe needs only D3D11 and the AMF
+	// runtime, and exists precisely so encoder init can be reproduced on the
+	// test machine without SteamVR or a headset in the loop. 1184x1184 @ 72 Hz
+	// is what a Pico 4 session negotiates, i.e. the failing configuration.
+	if (options.amf_probe)
+		return run_amf_probe(1184, 1184, 72.f, options.bitrate_mbps * 1'000'000u);
 
 #ifdef WIVRNNX_HAVE_WIVRN
 	if (options.server.pin.empty())

@@ -182,6 +182,36 @@ bool AmfStreamEncoder::create_component(AmfContext & context, const AmfEncodePar
 {
 	const wchar_t * id = codec == VideoCodec::h265 ? AMFVideoEncoder_HEVC : AMFVideoEncoderVCE_AVC;
 
+	if (create_component_once(context, params, codec, id, true))
+		return true;
+
+	// The Polaris legacy runtime (amfrt64 1.4.31, RX 580) takes the AVC
+	// ULTRA_LOW_LATENCY usage preset at SetProperty time and then answers
+	// everything after it — further SetProperty, GetCaps, Init — with
+	// AMF_ACCESS_DENIED. Same context, same dimensions: HEVC's
+	// ULTRA_LOW_LATENCY preset is fine, and so is every other AVC usage. So
+	// one retry with LOW_LATENCY, which that runtime accepts and which is
+	// still a one-in-one-out low-latency mode; drivers where ULTRA works
+	// never reach this. Pointless when the component itself could not be
+	// created — a second CreateComponent would only fail the same way.
+	if (codec == VideoCodec::h264 && component_was_created_ &&
+	    create_component_once(context, params, codec, id, false))
+	{
+		log_line("AMF[%s]: this runtime refuses the H.264 ULTRA_LOW_LATENCY usage, using LOW_LATENCY",
+		         label_);
+		return true;
+	}
+	return false;
+}
+
+bool AmfStreamEncoder::create_component_once(AmfContext & context,
+                                             const AmfEncodeParams & params,
+                                             VideoCodec codec,
+                                             const wchar_t * id,
+                                             bool ultra_low_latency)
+{
+	component_was_created_ = false;
+
 	amf::AMFComponent * component = nullptr;
 	AMF_RESULT res = AmfLoader::instance().factory()->CreateComponent(context.get(), id, &component);
 	if (res != AMF_OK || component == nullptr)
@@ -192,12 +222,14 @@ bool AmfStreamEncoder::create_component(AmfContext & context, const AmfEncodePar
 		         amf_result_name(res));
 		return false;
 	}
+	component_was_created_ = true;
 
 	component_ = component;
 	codec_ = codec;
 	has_query_timeout_ = false;
 
-	const bool configured = codec == VideoCodec::h265 ? configure_h265(params) : configure_h264(params);
+	const bool configured = codec == VideoCodec::h265 ? configure_h265(params)
+	                                                  : configure_h264(params, ultra_low_latency);
 	if (not configured)
 	{
 		component_->Terminate();
@@ -247,151 +279,201 @@ bool AmfStreamEncoder::create_component(AmfContext & context, const AmfEncodePar
 // an H.264 encoder there is also handed every HEVC and AV1 property. That is
 // harmless only because SetProperty on an unknown name returns an error nobody
 // checks. Here the two configurations are separate functions.
+// Every configure-time SetProperty goes through SET below, which logs the
+// per-call result when it is not AMF_OK. SetProperty rejections are otherwise
+// silent — the component happily Init()s without the property, or refuses to
+// Init at all, and nothing says which call was the problem. On the Polaris
+// legacy driver that difference is live: its AVC component refused Init with
+// AMF_ACCESS_DENIED while every SetProperty looked fine.
+#define SET(name, ...) \
+	log_set_result(#name, e->SetProperty(name, __VA_ARGS__), rejected)
+
 bool AmfStreamEncoder::configure_h265(const AmfEncodeParams & params)
 {
 	amf::AMFComponent * e = component_;
 	const amf_int64 bitrate = params.bitrate_bps;
 	const amf_int32 fps = static_cast<amf_int32>(params.refresh_hz > 1.f ? params.refresh_hz : 90.f);
+	int rejected = 0;
 
 	// :308 - the usage preset is what puts the encoder in one-in-one-out mode
 	// with no lookahead, which is the whole reason this is usable for VR.
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_USAGE, AMF_VIDEO_ENCODER_HEVC_USAGE_ULTRA_LOW_LATENCY);
+	SET(AMF_VIDEO_ENCODER_HEVC_USAGE, AMF_VIDEO_ENCODER_HEVC_USAGE_ULTRA_LOW_LATENCY);
 
 	// :313 - CBR. Filler data (:318) is deliberately *not* enabled: it pads every
 	// frame out to the full bitrate budget, which on a Wi-Fi link is bandwidth
 	// spent on nothing. WiVRn's own encoders run CBR without it.
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
-	               AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR);
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_FILLER_DATA_ENABLE, false);
+	SET(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
+	    AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR);
+	SET(AMF_VIDEO_ENCODER_HEVC_FILLER_DATA_ENABLE, false);
 
 	// :329
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, bitrate);
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, bitrate);
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMESIZE,
-	               ::AMFConstructSize(static_cast<amf_int32>(params.width),
-	                                  static_cast<amf_int32>(params.height)));
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMERATE, ::AMFConstructRate(fps, 1));
+	SET(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, bitrate);
+	SET(AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, bitrate);
+	SET(AMF_VIDEO_ENCODER_HEVC_FRAMESIZE,
+	    ::AMFConstructSize(static_cast<amf_int32>(params.width),
+	                       static_cast<amf_int32>(params.height)));
+	SET(AMF_VIDEO_ENCODER_HEVC_FRAMERATE, ::AMFConstructRate(fps, 1));
 
 	// :352 - speed over quality. A Polaris VCE has to encode two eye images per
 	// frame here; anything else is not going to hold 72 Hz.
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET,
-	               AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED);
+	SET(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET,
+	    AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED);
 
 	// :364
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_COLOR_BIT_DEPTH, AMF_COLOR_BIT_DEPTH_8);
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_PROFILE, AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN);
+	SET(AMF_VIDEO_ENCODER_HEVC_COLOR_BIT_DEPTH, AMF_COLOR_BIT_DEPTH_8);
+	SET(AMF_VIDEO_ENCODER_HEVC_PROFILE, AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN);
 
 	// :396 and :427 - full-range BT.709. Not a preference: the client builds its
 	// YCbCr sampler with eItuFull and eYcbcr709 hardcoded, overriding whatever
 	// the decoder suggests (client/decoder/android/android_decoder.cpp:368-369),
 	// and the Linux encoders match that (server/encoder/ffmpeg/video_encoder_va.cpp:285
 	// sets AVCOL_RANGE_JPEG). Anything else here is a washed-out picture.
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_NOMINAL_RANGE, AMF_VIDEO_ENCODER_HEVC_NOMINAL_RANGE_FULL);
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PROFILE,
-	               AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_709);
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_TRANSFER_CHARACTERISTIC,
-	               AMF_COLOR_TRANSFER_CHARACTERISTIC_GAMMA22);
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PRIMARIES, AMF_COLOR_PRIMARIES_BT709);
+	SET(AMF_VIDEO_ENCODER_HEVC_NOMINAL_RANGE, AMF_VIDEO_ENCODER_HEVC_NOMINAL_RANGE_FULL);
+	SET(AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PROFILE,
+	    AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_709);
+	SET(AMF_VIDEO_ENCODER_HEVC_OUTPUT_TRANSFER_CHARACTERISTIC,
+	    AMF_COLOR_TRANSFER_CHARACTERISTIC_GAMMA22);
+	SET(AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PRIMARIES, AMF_COLOR_PRIMARIES_BT709);
 
 	// :453 - infinite GOP: no periodic IDR at all. Every IDR this stream ever
 	// carries is one the idr tracker asked for, either because a client just
 	// connected or because the headset lost a frame.
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, 0);
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, 0);
+	SET(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, 0);
+	SET(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, 0);
 
 	// :459 - no access unit delimiters. The client's MediaCodec does not need
 	// them and they are bytes on the wire.
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_INSERT_AUD, false);
+	SET(AMF_VIDEO_ENCODER_HEVC_INSERT_AUD, false);
 
 	// :461 - a VBV of a little over one frame's worth of bits. Larger buffers
 	// let the encoder spend several frames paying back a spike, which is exactly
 	// the latency this path cannot afford.
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE,
-	               static_cast<amf_int64>(static_cast<double>(bitrate) / fps * 1.1));
+	SET(AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE,
+	    static_cast<amf_int64>(static_cast<double>(bitrate) / fps * 1.1));
 
 	// :465 - one reference frame, so a P frame only ever depends on the frame
 	// before it. With no FEC yet, that is what keeps a single lost frame from
-	// poisoning an arbitrarily long chain.
-	e->SetProperty(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES, 0);
+	// poisoning an arbitrarily long chain. Legacy runtimes (Polaris) call 0
+	// OUT_OF_RANGE; there the explicit 1 says the same thing in their dialect.
+	if (e->SetProperty(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES, 0) != AMF_OK)
+		SET(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES, 1);
 
 	// :370 - QueryOutput can block instead of being spun on, if the runtime
 	// says so.
 	amf::AMFCaps * caps = nullptr;
-	if (e->GetCaps(&caps) == AMF_OK && caps != nullptr)
+	const AMF_RESULT caps_res = e->GetCaps(&caps);
+	if (caps_res == AMF_OK && caps != nullptr)
 	{
 		amf_bool supported = false;
 		if (caps->GetProperty(AMF_VIDEO_ENCODER_CAPS_HEVC_QUERY_TIMEOUT_SUPPORT, &supported) == AMF_OK)
 			has_query_timeout_ = supported;
 		caps->Release();
 	}
+	else
+		log_line("AMF[%s]: %s GetCaps failed (%s)", label_, video_codec_name(codec_), amf_result_name(caps_res));
 	if (has_query_timeout_)
-		e->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT,
-		               static_cast<amf_int64>(params.poll_timeout_ms));
+		SET(AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT,
+		    static_cast<amf_int64>(params.poll_timeout_ms));
 
+	if (rejected != 0)
+		log_line("AMF[%s]: %s %d configure propert%s rejected (see above)",
+		         label_,
+		         video_codec_name(codec_),
+		         rejected,
+		         rejected == 1 ? "y" : "ies");
 	return true;
 }
 
-bool AmfStreamEncoder::configure_h264(const AmfEncodeParams & params)
+bool AmfStreamEncoder::configure_h264(const AmfEncodeParams & params, bool ultra_low_latency)
 {
 	amf::AMFComponent * e = component_;
 	const amf_int64 bitrate = params.bitrate_bps;
 	const amf_int32 fps = static_cast<amf_int32>(params.refresh_hz > 1.f ? params.refresh_hz : 90.f);
+	int rejected = 0;
 
-	// :154
-	e->SetProperty(AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY);
+	// :154 - ULTRA_LOW_LATENCY, except on the retry create_component makes for
+	// runtimes whose AVC component is poisoned by it (see there).
+	SET(AMF_VIDEO_ENCODER_USAGE,
+	    ultra_low_latency ? AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY
+	                      : AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY);
 	// :163 - High profile, level 4.2 as ALVR does at :167. Every Pico decodes it.
-	e->SetProperty(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_HIGH);
-	e->SetProperty(AMF_VIDEO_ENCODER_PROFILE_LEVEL, 42);
+	SET(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_HIGH);
+	SET(AMF_VIDEO_ENCODER_PROFILE_LEVEL, 42);
 
 	// :170, filler off for the same reason as HEVC above.
-	e->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
-	e->SetProperty(AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE, false);
+	SET(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
+	SET(AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE, false);
 	// :188 - CABAC; it is worth a few percent and every decoder here has it.
-	e->SetProperty(AMF_VIDEO_ENCODER_CABAC_ENABLE, AMF_VIDEO_ENCODER_CABAC);
+	SET(AMF_VIDEO_ENCODER_CABAC_ENABLE, AMF_VIDEO_ENCODER_CABAC);
 
 	// :195
-	e->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, bitrate);
-	e->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, bitrate);
-	e->SetProperty(AMF_VIDEO_ENCODER_FRAMESIZE,
-	               ::AMFConstructSize(static_cast<amf_int32>(params.width),
-	                                  static_cast<amf_int32>(params.height)));
-	e->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, ::AMFConstructRate(fps, 1));
+	SET(AMF_VIDEO_ENCODER_TARGET_BITRATE, bitrate);
+	SET(AMF_VIDEO_ENCODER_PEAK_BITRATE, bitrate);
+	SET(AMF_VIDEO_ENCODER_FRAMESIZE,
+	    ::AMFConstructSize(static_cast<amf_int32>(params.width),
+	                       static_cast<amf_int32>(params.height)));
+	SET(AMF_VIDEO_ENCODER_FRAMERATE, ::AMFConstructRate(fps, 1));
 	// :199 - no B pictures. They reorder, and reordering is latency.
-	e->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, 0);
+	SET(AMF_VIDEO_ENCODER_B_PIC_PATTERN, 0);
 
 	// :214
-	e->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET, AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
+	SET(AMF_VIDEO_ENCODER_QUALITY_PRESET, AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
 
 	// :244 and :271 - full-range BT.709, see configure_h265.
-	e->SetProperty(AMF_VIDEO_ENCODER_FULL_RANGE_COLOR, true);
-	e->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE, AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_709);
-	e->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
-	               AMF_COLOR_TRANSFER_CHARACTERISTIC_GAMMA22);
-	e->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES, AMF_COLOR_PRIMARIES_BT709);
+	SET(AMF_VIDEO_ENCODER_FULL_RANGE_COLOR, true);
+	SET(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE, AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_709);
+	SET(AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
+	    AMF_COLOR_TRANSFER_CHARACTERISTIC_GAMMA22);
+	SET(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES, AMF_COLOR_PRIMARIES_BT709);
 
 	// :293 - no periodic IDR.
-	e->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, 0);
+	SET(AMF_VIDEO_ENCODER_IDR_PERIOD, 0);
 	// :297
-	e->SetProperty(AMF_VIDEO_ENCODER_INSERT_AUD, false);
+	SET(AMF_VIDEO_ENCODER_INSERT_AUD, false);
 	// :299
-	e->SetProperty(AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE,
-	               static_cast<amf_int64>(static_cast<double>(bitrate) / fps * 1.1));
-	// :301
-	e->SetProperty(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, 0);
+	SET(AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE,
+	    static_cast<amf_int64>(static_cast<double>(bitrate) / fps * 1.1));
+	// :301 - one reference frame; 0 is OUT_OF_RANGE on legacy runtimes, where
+	// the explicit 1 means the same. See the HEVC twin above.
+	if (e->SetProperty(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, 0) != AMF_OK)
+		SET(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, 1);
 
 	// :220
 	amf::AMFCaps * caps = nullptr;
-	if (e->GetCaps(&caps) == AMF_OK && caps != nullptr)
+	const AMF_RESULT caps_res = e->GetCaps(&caps);
+	if (caps_res == AMF_OK && caps != nullptr)
 	{
 		amf_bool supported = false;
 		if (caps->GetProperty(AMF_VIDEO_ENCODER_CAPS_QUERY_TIMEOUT_SUPPORT, &supported) == AMF_OK)
 			has_query_timeout_ = supported;
 		caps->Release();
 	}
+	else
+		log_line("AMF[%s]: %s GetCaps failed (%s)", label_, video_codec_name(codec_), amf_result_name(caps_res));
 	if (has_query_timeout_)
-		e->SetProperty(AMF_VIDEO_ENCODER_QUERY_TIMEOUT, static_cast<amf_int64>(params.poll_timeout_ms));
+		SET(AMF_VIDEO_ENCODER_QUERY_TIMEOUT, static_cast<amf_int64>(params.poll_timeout_ms));
 
+	if (rejected != 0)
+		log_line("AMF[%s]: %s %d configure propert%s rejected (see above)",
+		         label_,
+		         video_codec_name(codec_),
+		         rejected,
+		         rejected == 1 ? "y" : "ies");
 	return true;
+}
+
+#undef SET
+
+void AmfStreamEncoder::log_set_result(const char * property, int result, int & rejected)
+{
+	if (result == AMF_OK)
+		return;
+	++rejected;
+	log_line("AMF[%s]: %s SetProperty(%s) -> %s",
+	         label_,
+	         video_codec_name(codec_),
+	         property,
+	         amf_result_name(result));
 }
 
 void AmfStreamEncoder::close()

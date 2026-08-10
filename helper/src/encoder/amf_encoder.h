@@ -121,8 +121,18 @@ public:
 
 private:
 	bool create_component(AmfContext & context, const AmfEncodeParams & params, VideoCodec codec);
+	// One create+configure+Init attempt. `ultra_low_latency` selects the H.264
+	// usage preset; the retry with LOW_LATENCY is create_component's business.
+	// `id` is the AMF component id matching `codec`.
+	bool create_component_once(AmfContext & context,
+	                           const AmfEncodeParams & params,
+	                           VideoCodec codec,
+	                           const wchar_t * id,
+	                           bool ultra_low_latency);
 	bool configure_h265(const AmfEncodeParams & params);
-	bool configure_h264(const AmfEncodeParams & params);
+	bool configure_h264(const AmfEncodeParams & params, bool ultra_low_latency);
+	// `result` is an AMF_RESULT; int here to keep the AMF headers out.
+	void log_set_result(const char * property, int result, int & rejected);
 	void apply_frame_properties(void * surface, bool force_idr);
 	bool output_is_idr(void * data) const;
 
@@ -131,6 +141,9 @@ private:
 	VideoCodec codec_ = VideoCodec::h265;
 	AmfEncodeParams params_{};
 	bool has_query_timeout_ = false;
+	// Whether the last create_component_once() got past CreateComponent, i.e.
+	// whether its failure was the property set / Init and a retry can help.
+	bool component_was_created_ = false;
 	double last_encode_ms_ = 0.0;
 	// QPC ticks at the last submit(), so retrieve() can bound its own wait.
 	int64_t submitted_at_ = 0;
