@@ -136,7 +136,12 @@ int64_t PacedSender::pump(int64_t now_ns, const Sinks & sinks)
 		// immediately after the group's last data shard, so it travels in (or right
 		// at the edge of) the same pacing micro-burst and reaches the headset while
 		// the group is still open there.
-		if (fec_active_ and group_.full())
+		//
+		// block_full() was full() before common/fec.h gained the interleaved,
+		// adaptive layout. This builder is never handed a set_layout(), so its depth
+		// stays at the default of 1 and a block is exactly one group of
+		// fec::group_size shards — the same point this fired at before.
+		if (fec_active_ and group_.block_full())
 			send_parity(sinks);
 
 		// Leaky bucket: hold the next micro-burst back until the frame's schedule

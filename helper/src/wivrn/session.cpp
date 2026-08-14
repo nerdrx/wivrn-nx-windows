@@ -927,7 +927,11 @@ void Session::apply_bitrate(std::optional<uint32_t> bitrate_bps)
 	// the link, and the parity shards are on that link too: an encoder left at the
 	// full number would put 12.5% more than the budget on the wire with FEC on, and
 	// the controller would then spend its time chasing the loss it caused itself.
-	const double share = fec_enabled_ ? wivrn::fec::data_share : 1.0;
+	//
+	// data_share became a function of the group size when common/fec.h went
+	// adaptive. This port packs at the fixed default group size, so the ratio it
+	// asks for is the 8/9 the constant used to be.
+	const double share = fec_enabled_ ? wivrn::fec::data_share(wivrn::fec::group_size) : 1.0;
 	video_.set_bitrate(static_cast<uint32_t>(double(*bitrate_bps) * share));
 }
 
