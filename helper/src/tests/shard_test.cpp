@@ -643,7 +643,7 @@ std::vector<ReferenceParity> reference_parity(std::vector<uint8_t> & encoded,
 		shard.payload = std::span<uint8_t>(encoded).subspan(offset, next - offset);
 
 		builder.add(shard);
-		if (builder.full())
+		if (builder.block_full())
 			take_parity();
 
 		++shard.shard_idx;
@@ -774,7 +774,7 @@ void part_f_fec()
 		auto with_fec = plain;
 		with_fec.fec = true;
 		CHECK(VideoPacketizer::payload_budget(with_fec) ==
-		      data_shard::max_payload_size - fec::payload_reserve);
+		      data_shard::max_payload_size - fec::payload_reserve(fec::group_size));
 	}
 
 	// The whole point of the overhead, measured: one shard in group_size.
