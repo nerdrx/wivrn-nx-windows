@@ -37,3 +37,10 @@ Phase 0: skeleton — shim loads in SteamVR and registers a static HMD; helper
 streams fake poses over the pipe. Reference implementation for the driver
 surface: ALVR `alvr/server_openvr/cpp` (sparse-cloned under `reference/`,
 not committed).
+
+## License
+
+The driver (shim) and helper are licensed under GPL-3.0 — they link code from
+[WiVRn](https://github.com/WiVRn/WiVRn) (GPL-3.0). See [LICENSE](LICENSE).
+Bundled third-party notices (AMD AMF headers, Boost.PFR) ship in the release
+zip under `licenses/`.
